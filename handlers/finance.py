@@ -1,178 +1,133 @@
-"""Финансовый модуль: расходы, доходы, бюджет, ПП-продукты."""
-import logging, os, re, json, httpx
-from datetime import datetime
-from typing import Optional
-
+from aiogram import Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from tools.finance import build_budget_report, build_pp_report, savings_projection, DEFAULT_PP_PRODUCTS, detect_unhealthy
+import logging
 logger = logging.getLogger(__name__)
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-EXPENSE_CATEGORIES = {
-    "продукты":  {"emoji": "🛒", "keywords": ["пятёрочка","магнит","продукты","вкусвилл","еда","магазин","супермаркет"]},
-    "кафе":      {"emoji": "☕", "keywords": ["кафе","ресторан","кофейня","доставка","яндекс еда","самокат"]},
-    "такси":     {"emoji": "🚕", "keywords": ["такси","яндекс такси","убер","uber","каршеринг"]},
-    "косметика": {"emoji": "💄", "keywords": ["косметика","уход","крем","тональный","помада","аптека","сефора"]},
-    "одежда":    {"emoji": "👗", "keywords": ["одежда","zara","h&m","вещи","обувь"]},
-    "подписки":  {"emoji": "📱", "keywords": ["подписка","spotify","netflix","яндекс плюс","apple"]},
-    "блог":      {"emoji": "📸", "keywords": ["блог","реклама","съёмка","реквизит"]},
-    "здоровье":  {"emoji": "💊", "keywords": ["врач","больница","витамины","спорт","фитнес"]},
-    "транспорт": {"emoji": "🚇", "keywords": ["метро","автобус","проездной"]},
-    "разное":    {"emoji": "📦", "keywords": []},
-}
+def register_finance_commands(dp: Dispatcher):
+    dp.message.register(cmd_money, Command("money"))
+    dp.message.register(cmd_pp, Command("pp"))
+    dp.message.register(cmd_shop, Command("shop"))
+    dp.message.register(cmd_barter, Command("barter"))
+    dp.message.register(cmd_savings_full, Command("savings"))
+    dp.message.register(cmd_add_savings_cmd, Command("add"))
+    dp.message.register(cmd_income, Command("income"))
+    dp.callback_query.register(handle_money_callback, lambda c: c.data and c.data.startswith("money:"))
+    dp.callback_query.register(cb_save_20pct, lambda c: c.data and c.data.startswith("save20:"))
+    dp.callback_query.register(cb_shop_clear, lambda c: c.data == "shop:clear")
 
-UNHEALTHY_MAP = {
-    "чипсы": "орешки", "сухарики": "хлебцы", "газировка": "воду с лимоном",
-    "конфеты": "финики или горький шоколад", "торт": "творожную запеканку",
-    "фастфуд": "куриную грудку с овощами", "мороженое": "замороженный банан",
-    "печенье": "протеиновый батончик",
-}
+async def cmd_money(message: Message, db):
+    uid = message.from_user.id
+    total = db.get_expenses_total(uid, 30)
+    savings = db.get_savings_total(uid)
+    goal = int(db.get_profile(uid).get("savings_goal", 500000))
+    pct = round(savings/goal*100,1) if goal else 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 За месяц", callback_data="money:month")],
+        [InlineKeyboardButton(text="🏠 Накопления", callback_data="money:savings")],
+        [InlineKeyboardButton(text="🥗 ПП", callback_data="money:pp")],
+    ])
+    await message.answer(f"💰 *Финансы*\nЗа месяц: *{total:,} ₽*\nКопилка: *{savings:,} ₽* ({pct}%)", parse_mode="Markdown", reply_markup=kb)
 
-DEFAULT_PP_PRODUCTS = [
-    ("куриная грудка","белок",5), ("яйца","белок",7), ("творог","белок",5),
-    ("гречка","углеводы",14), ("рис","углеводы",14), ("овсянка","углеводы",10),
-    ("огурцы","овощи",4), ("помидоры","овощи",4), ("брокколи","овощи",5),
-    ("яблоки","фрукты",5), ("бананы","фрукты",5),
-    ("оливковое масло","жиры",30), ("орехи","жиры",14), ("кефир","молочное",5),
-]
+async def handle_money_callback(callback, db):
+    action = callback.data.split(":")[1]
+    uid = callback.from_user.id
+    if action == "month": text = build_budget_report(uid, db, 30)
+    elif action == "week": text = build_budget_report(uid, db, 7)
+    elif action == "savings": text = savings_projection(uid, db)
+    elif action == "pp": text = build_pp_report(uid, db)
+    else: text = "Неизвестное действие"
+    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.answer()
 
+async def cmd_pp(message: Message, db):
+    uid = message.from_user.id
+    if not db.get_pp_products(uid):
+        for name, cat, days in DEFAULT_PP_PRODUCTS:
+            db.add_pp_product(uid, name, cat, days)
+    await message.answer(build_pp_report(uid, db), parse_mode="Markdown")
 
-def detect_category(text: str) -> str:
-    tl = text.lower()
-    for cat, info in EXPENSE_CATEGORIES.items():
-        for kw in info["keywords"]:
-            if kw in tl:
-                return cat
-    return "разное"
+async def cmd_shop(message: Message, db):
+    uid = message.from_user.id
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        item = parts[1].strip()
+        warn = detect_unhealthy(item)
+        if warn:
+            await message.answer(warn, parse_mode="Markdown"); return
+        db.add_to_shopping(uid, item)
+        await message.answer(f"✅ Добавила: *{item}*", parse_mode="Markdown"); return
+    shopping = db.get_shopping_list(uid)
+    text = "🛒 *Список покупок:*\n\n" + ("".join(f"  🥗 {i['item']}\n" for i in shopping) if shopping else "_Пусто_\n")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Всё куплено", callback_data="shop:clear")]]) if shopping else None
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
 
+async def cmd_barter(message: Message, db):
+    uid = message.from_user.id
+    received = db.get_barters(uid, "received")
+    total = db.get_barter_saved_total(uid)
+    wishlist = db.get_barters(uid, "wishlist")
+    followers = db.get_latest_followers(uid)
+    text = "🤝 *Бартеры:*\n\n"
+    if received: text += f"✅ Сэкономлено: *{total:,} ₽*\n\n"
+    if wishlist:
+        text += "🎯 *Хочу:*\n"
+        for b in wishlist:
+            need = b.get("followers_needed", 0)
+            status = " ← *ПИШИ!* 🔥" if need and need <= followers else (f" (нужно +{need-followers})" if need else "")
+            text += f"  • {b['brand']}{status}\n"
+    else: text += "_Список пуст_\n"
+    text += f"\n📊 Подписчики: *{followers}*"
+    await message.answer(text, parse_mode="Markdown")
 
-def detect_unhealthy(text: str) -> Optional[str]:
-    tl = text.lower()
-    for kw, alt in UNHEALTHY_MAP.items():
-        if kw in tl:
-            return f"⚠️ Заметила *{kw}* в списке — это не ПП. Заменить на {alt}?"
-    return None
+async def cmd_savings_full(message: Message, db):
+    uid = message.from_user.id
+    await message.answer(savings_projection(uid, db), parse_mode="Markdown")
 
+async def cmd_add_savings_cmd(message: Message, db):
+    uid = message.from_user.id
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Напиши: */add 5000*", parse_mode="Markdown"); return
+    try: amount = int(parts[1].replace(",",""))
+    except: await message.answer("Не поняла сумму."); return
+    db.add_savings(uid, amount)
+    total = db.get_savings_total(uid)
+    goal = int(db.get_profile(uid).get("savings_goal", 500000))
+    pct = round(total/goal*100,1) if goal else 0
+    await message.answer(f"✅ *{amount:,} ₽* в копилку!\n🏠 Итого: *{total:,} ₽* ({pct}%)", parse_mode="Markdown")
 
-async def parse_expense_with_ai(text: str) -> Optional[dict]:
-    if not ANTHROPIC_API_KEY:
-        return _parse_simple(text)
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 250,
-                      "messages": [{"role": "user", "content":
-                          f'Извлеки расход. Верни ТОЛЬКО JSON без markdown:\n{{"amount":число,"category":"продукты|кафе|такси|косметика|одежда|подписки|блог|здоровье|транспорт|разное","shop":"магазин или пусто","products":["список"],"description":"описание"}}\n\nТекст: {text}'}]}
-            )
-        if resp.status_code == 200:
-            raw = resp.json()["content"][0]["text"].strip().replace("```json","").replace("```","")
-            return json.loads(raw)
-    except Exception as e:
-        logger.error(f"AI expense: {e}")
-    return _parse_simple(text)
+async def cmd_income(message: Message, db):
+    uid = message.from_user.id
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Напиши: */income 50000*", parse_mode="Markdown"); return
+    try: amount = int(parts[1].replace(",",""))
+    except: await message.answer("Не поняла."); return
+    source = parts[2] if len(parts) > 2 else "доход"
+    db.add_income(uid, amount, source)
+    save20 = amount // 5
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🏠 Отложить {save20:,} ₽", callback_data=f"save20:{save20}")],
+        [InlineKeyboardButton(text="Пропустить", callback_data="save20:skip")],
+    ])
+    await message.answer(f"✅ Доход *{amount:,} ₽* записан!\nОтложить 20% в копилку?", parse_mode="Markdown", reply_markup=kb)
 
+async def cb_save_20pct(callback, db):
+    uid = callback.from_user.id
+    val = callback.data.split(":")[1]
+    if val == "skip":
+        await callback.answer("Хорошо!"); await callback.message.edit_reply_markup(reply_markup=None); return
+    amount = int(val)
+    db.add_savings(uid, amount)
+    total = db.get_savings_total(uid)
+    goal = int(db.get_profile(uid).get("savings_goal", 500000))
+    pct = round(total/goal*100,1) if goal else 0
+    await callback.message.edit_text(f"🏠 *{amount:,} ₽ отложены!*\nИтого: *{total:,} ₽* ({pct}%)", parse_mode="Markdown")
+    await callback.answer("✅")
 
-def _parse_simple(text: str) -> Optional[dict]:
-    nums = re.findall(r'(\d[\d\s]*)[₽р]', text) or re.findall(r'\b(\d{3,6})\b', text)
-    if not nums:
-        return None
-    return {"amount": int(nums[0].replace(" ","")), "category": detect_category(text),
-            "shop": "", "products": [], "description": text[:100]}
-
-
-def build_budget_report(user_id: int, db, days: int = 30) -> str:
-    by_cat = db.get_expenses_by_category(user_id, days)
-    total = sum(by_cat.values())
-    limits = db.get_budget_limits(user_id)
-    income = db.get_income_total(user_id, days)
-    savings = db.get_savings_total(user_id)
-    goal = int(db.get_profile(user_id).get("savings_goal", 500000))
-    barter_saved = db.get_barter_saved_total(user_id)
-    period = "месяц" if days >= 28 else f"{days} дней"
-    text = f"💰 *Финансы за {period}:*\n\n"
-    if income:
-        text += f"📈 Доход: *{income:,} ₽*\n"
-    text += f"📉 Расходы: *{total:,} ₽*\n"
-    if income:
-        bal = income - total
-        text += f"{'✅' if bal >= 0 else '❌'} Остаток: *{bal:,} ₽*\n"
-    if by_cat:
-        text += "\n*По категориям:*\n"
-        for cat, amt in sorted(by_cat.items(), key=lambda x: x[1], reverse=True):
-            emoji = EXPENSE_CATEGORIES.get(cat, {"emoji":"📦"})["emoji"]
-            pct = round(amt/total*100) if total else 0
-            text += f"{emoji} {cat}: *{amt:,} ₽* ({pct}%)\n"
-            if cat in limits and amt > limits[cat]:
-                text += f"  ⚠️ Лимит превышен на {amt-limits[cat]:,} ₽!\n"
-    if total and by_cat:
-        max_cat = max(by_cat, key=by_cat.get)
-        if by_cat[max_cat] > total * 0.3:
-            text += f"\n💡 {max_cat.capitalize()} — {round(by_cat[max_cat]/total*100)}% расходов, здесь можно сэкономить\n"
-    text += f"\n🏠 Копилка: *{savings:,}* из {goal:,} ₽ ({round(savings/goal*100,1) if goal else 0}%)\n"
-    if barter_saved:
-        text += f"🤝 Бартер сэкономил: *+{barter_saved:,} ₽*\n"
-    return text
-
-
-def build_pp_report(user_id: int, db) -> str:
-    missing = db.get_missing_products(user_id)
-    shopping = db.get_shopping_list(user_id)
-    text = "🥗 *ПП-статус:*\n\n"
-    if missing:
-        text += "⚠️ *Нужно купить:*\n"
-        for p in missing[:8]:
-            days_ago = ""
-            if p.get("last_bought"):
-                try:
-                    d = (datetime.utcnow() - datetime.fromisoformat(p["last_bought"])).days
-                    days_ago = f" (куплено {d} дн. назад)"
-                except Exception:
-                    pass
-            text += f"  • {p['name']}{days_ago}\n"
-        text += "\n"
-    if shopping:
-        text += "🛒 *Список покупок:*\n"
-        for item in shopping[:10]:
-            text += f"  {'🥗' if item['is_pp'] else '⚠️'} {item['item']}"
-            if item.get("amount"):
-                text += f" ({item['amount']})"
-            text += "\n"
-    else:
-        text += "✅ Список покупок пуст\n"
-    return text
-
-
-def savings_projection(user_id: int, db) -> str:
-    profile = db.get_profile(user_id)
-    savings = db.get_savings_total(user_id)
-    goal = int(profile.get("savings_goal", 500000))
-    remaining = goal - savings
-    if remaining <= 0:
-        return "🎉 *Цель достигнута!* Ты накопила 500 000 ₽!"
-    monthly_income = int(profile.get("monthly_income", 0))
-    monthly_exp = db.get_expenses_total(user_id, 30)
-    barter_saved = db.get_barter_saved_total(user_id)
-    filled = min(10, int(savings/goal*10)) if goal else 0
-    bar = "█"*filled + "░"*(10-filled)
-    text = f"🏠 *Копилка на квартиру:*\n{bar} {round(savings/goal*100,1) if goal else 0}%\n"
-    text += f"Накоплено: *{savings:,} ₽* из {goal:,} ₽\n"
-    text += f"Осталось: *{remaining:,} ₽*\n"
-    if barter_saved:
-        text += f"🤝 Бартер сэкономил: *{barter_saved:,} ₽*\n"
-    if monthly_income and monthly_exp:
-        free = monthly_income - monthly_exp
-        if free > 0:
-            months = remaining / free
-            years = int(months // 12); mons = int(months % 12)
-            text += f"\nПри темпе {free:,} ₽/мес: ещё ~"
-            text += f"{years} лет {mons} мес.\n" if years else f"{mons} мес.\n"
-            by_cat = db.get_expenses_by_category(user_id, 30)
-            text += "\n*Как ускорить:*\n"
-            if by_cat.get("кафе",0) > 3000:
-                save = by_cat["кафе"]//2
-                text += f"☕ Кафе -50% → +{save:,} ₽/мес\n"
-            if by_cat.get("такси",0) > 2000:
-                save = by_cat["такси"]//2
-                text += f"🚕 Такси -50% → +{save:,} ₽/мес\n"
-            text += "🤝 Бартер = прямая экономия → ускоряет цель\n"
-    return text
+async def cb_shop_clear(callback, db):
+    db.clear_shopping_list(callback.from_user.id)
+    await callback.message.edit_text("✅ Список очищен!")
+    await callback.answer()
